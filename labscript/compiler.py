@@ -82,7 +82,10 @@ class Compiler(object):
         # gets reset
         self.suppress_mild_warnings = True
         self.suppress_all_warnings = False
-        self.compression = 'gzip'  # set to 'gzip' for compression 
+        self.compression = 'gzip'  # set to 'gzip' for compression
+
+        # Virtual analog channel groups registered via VirtualAnalogOut()
+        self.virtual_analog_groups = []
 
 
 compiler = Compiler()

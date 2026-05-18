@@ -13,6 +13,7 @@
 
 """Classes for devices channels that are outputs"""
 
+import inspect
 import sys
 
 import numpy as np
@@ -1210,8 +1211,251 @@ class AnalogQuantity(Output):
 class AnalogOut(AnalogQuantity):
     """Analog Output class for use with all devices that support timed analog outputs."""
     description = "analog output"
-    
-    
+
+
+class _VirtualAnalogChannel(AnalogQuantity):
+    """A virtual analog channel used internally by :func:`VirtualAnalogOut`.
+
+    Stores instructions without being registered in the device tree.  At compile
+    time a :class:`_VirtualAnalogGroup` translates these instructions into
+    instructions on real :class:`AnalogOut` channels via a user-supplied transform.
+    """
+
+    description = "virtual analog output"
+    default_value = 0.0
+
+    def __init__(self, name):
+        # Deliberately bypass Device.__init__ so this object is never added to the
+        # device tree or compiler inventory.
+        self.name = name
+        self.instructions = {}
+        self.ramp_limits = []
+        self.limits = None
+        self.unit_conversion_class = None
+
+    @property
+    def t0(self):
+        return 0.0
+
+    def add_instruction(self, time, instruction, units=None):
+        """Store an instruction, bypassing hardware-device checks."""
+        if not compiler.start_called:
+            raise LabscriptError("Cannot add instructions prior to calling start()")
+        time = round(time, 10)
+        if isinstance(instruction, dict):
+            instruction["end time"] = round(instruction["end time"], 10)
+            instruction["initial time"] = round(instruction["initial time"], 10)
+        if time < self.t0:
+            raise LabscriptError(
+                f"{self.description} {self.name} has an instruction at t={time}s. "
+                f"The earliest possible output is at t={self.t0}."
+            )
+        if time in self.instructions:
+            if not compiler.suppress_all_warnings:
+                current_value = self.instruction_to_string(self.instructions[time])
+                new_value = self.instruction_to_string(
+                    self.apply_calibration(instruction, units)
+                    if units and not isinstance(instruction, dict)
+                    else instruction
+                )
+                sys.stderr.write(
+                    f"WARNING: State of {self.description} {self.name} at t={time}s "
+                    f"has already been set to {current_value}. Overwriting to "
+                    f"{new_value}.\n"
+                )
+        if isinstance(instruction, dict):
+            for start, end in self.ramp_limits:
+                if start < time < end or start < instruction["end time"] < end:
+                    raise LabscriptError(
+                        f"State of {self.description} {self.name} from t={start}s to "
+                        f"{end}s has already been set. Cannot set ramp from "
+                        f"t={time}s to {instruction['end time']}s."
+                    )
+            self.ramp_limits.append((time, instruction["end time"]))
+            if time > instruction["end time"]:
+                raise LabscriptError(
+                    f"{self.description} {self.name} has a ramp with negative duration."
+                )
+            if instruction["clock rate"] == 0:
+                raise LabscriptError("A nonzero sample rate is required.")
+        else:
+            if units is not None:
+                instruction = self.apply_calibration(instruction, units)
+        self.instructions[time] = instruction
+
+
+class _VirtualAnalogGroup:
+    """Manages the compile-time translation from N virtual to N physical analog channels."""
+
+    def __init__(self, func, physical_channels):
+        n_virt = len(inspect.signature(func).parameters)
+        if n_virt != len(physical_channels):
+            raise LabscriptError(
+                f"VirtualAnalogOut: the transform function has {n_virt} parameter(s) "
+                f"but {len(physical_channels)} physical channel(s) were given. "
+                "These must match."
+            )
+        self.func = func
+        self.physical_channels = list(physical_channels)
+        self.virtual_channels = [
+            _VirtualAnalogChannel(f"virtual_{phys.name}")
+            for phys in physical_channels
+        ]
+
+    def compile(self):
+        """Translate virtual channel instructions into physical channel instructions.
+
+        Called by :func:`generate_code` before pseudoclock code generation so that
+        the physical channels see the transformed instructions during their normal
+        compile pass.
+        """
+        # Ensure every virtual channel has an instruction anchoring t=0 so that
+        # make_timeseries() never wraps around before the first instruction.
+        for ch in self.virtual_channels:
+            if not ch.instructions or min(ch.instructions.keys()) > 0:
+                ch.instructions.setdefault(0, ch.default_value)
+
+        # Populate ch.times on each virtual channel (required by make_timeseries).
+        for ch in self.virtual_channels:
+            ch.get_change_times()
+
+        # Segment boundaries: every instruction start time and every ramp end time.
+        boundary_times = set()
+        for ch in self.virtual_channels:
+            for t, instr in ch.instructions.items():
+                boundary_times.add(t)
+                if isinstance(instr, dict):
+                    boundary_times.add(instr["end time"])
+
+        all_times = sorted(boundary_times)
+        if not all_times:
+            return
+
+        # Snapshot each virtual channel's state at every boundary time.
+        for ch in self.virtual_channels:
+            ch.make_timeseries(all_times)
+
+        for i, t in enumerate(all_times):
+            t_next = all_times[i + 1] if i + 1 < len(all_times) else None
+
+            # Build the list of virtual states at this boundary.  If a ramp has
+            # exactly ended at t we substitute its evaluated final value so the
+            # physical channel sees a clean constant rather than a stale ramp dict.
+            virtual_states = []
+            for ch in self.virtual_channels:
+                state = ch.timeseries[i]
+                if isinstance(state, dict) and t >= state["end time"]:
+                    t_rel_end = np.array([state["end time"] - state["initial time"]])
+                    virtual_states.append(float(state["function"](t_rel_end)[0]))
+                else:
+                    virtual_states.append(state)
+
+            any_ramp = any(isinstance(s, dict) for s in virtual_states)
+
+            if not any_ramp:
+                # All virtual channels are constant at this boundary.
+                phys_values = self.func(*virtual_states)
+                if not hasattr(phys_values, "__len__"):
+                    phys_values = (phys_values,)
+                for j, phys_ch in enumerate(self.physical_channels):
+                    phys_ch.add_instruction(t, float(phys_values[j]))
+            elif t_next is not None:
+                # At least one virtual channel is ramping; add a custom ramp on each
+                # physical channel that spans the current segment [t, t_next).
+                duration = t_next - t
+                samplerate = max(
+                    s["clock rate"] for s in virtual_states if isinstance(s, dict)
+                )
+                for j in range(len(self.physical_channels)):
+                    phys_func = _VirtualAnalogGroup._make_phys_func(
+                        j, t, virtual_states, self.func
+                    )
+                    self.physical_channels[j].add_instruction(
+                        t,
+                        {
+                            "function": phys_func,
+                            "description": "virtual analog ramp",
+                            "initial time": t,
+                            "end time": t + duration,
+                            "clock rate": samplerate,
+                            "units": None,
+                        },
+                    )
+        # Clean up timeseries attributes (not needed after compile).
+        for ch in self.virtual_channels:
+            if hasattr(ch, "timeseries"):
+                del ch.timeseries
+
+    @staticmethod
+    def _make_phys_func(j, t_start, virtual_states, transform):
+        """Return a callable suitable for use as a labscript ramp function.
+
+        The returned function evaluates virtual channel states at absolute times
+        t_start + t_rel (where t_rel is a numpy array), applies *transform*, and
+        returns the j-th physical channel value.
+        """
+        states = list(virtual_states)  # snapshot to avoid closure mutation
+
+        def phys_func(t_rel):
+            t_abs = t_start + t_rel
+            v_vals = []
+            for state in states:
+                if isinstance(state, dict):
+                    v_vals.append(state["function"](t_abs - state["initial time"]))
+                else:
+                    v_vals.append(np.full_like(t_rel, state, dtype=float))
+            result = transform(*v_vals)
+            if hasattr(result, "__len__"):
+                return result[j]
+            return result
+
+        return phys_func
+
+
+def VirtualAnalogOut(func, *physical_channels):
+    """Create a group of virtual analog channels that compile down to physical channels.
+
+    At compile time the values of each virtual channel are collected, passed through
+    *func*, and the results are written as instructions on the corresponding physical
+    channels.  This allows the user to program experiment-level degrees of freedom
+    (e.g. a bias field and a gradient field) while the hardware runs physical coil
+    currents.
+
+    Args:
+        func (callable): Transform from virtual to physical values.  Must accept
+            the same number of positional arguments as there are *physical_channels*
+            and return a sequence of the same length.  The function must support
+            element-wise numpy array arguments so that ramp segments can be
+            evaluated correctly.
+        *physical_channels (:class:`AnalogOut`): Physical output channels that will
+            receive the transformed values.  The number must equal the number of
+            parameters of *func*.
+
+    Returns:
+        tuple[_VirtualAnalogChannel]: One virtual channel per physical channel, in
+        the same order as the parameters of *func*.
+
+    Example::
+
+        ao_plus  = AnalogOut('ao_plus',  parent_device, 'ao0')
+        ao_minus = AnalogOut('ao_minus', parent_device, 'ao1')
+
+        hh, ah = VirtualAnalogOut(
+            lambda hh, ah: ((hh + ah) / 2, (hh - ah) / 2),
+            ao_plus,
+            ao_minus,
+        )
+
+        start()
+        hh.constant(t=0, value=1.0)
+        ah.ramp(t=1, duration=2, initial=0, final=5, samplerate=1000)
+        stop(t=5)
+    """
+    group = _VirtualAnalogGroup(func, physical_channels)
+    compiler.virtual_analog_groups.append(group)
+    return tuple(group.virtual_channels)
+
+
 class StaticAnalogQuantity(Output):
     """Base class for :obj:`StaticAnalogOut`.
 
