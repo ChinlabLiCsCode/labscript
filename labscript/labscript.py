@@ -82,6 +82,7 @@ from .outputs import (
     StaticDigitalQuantity,
     Trigger,
     VirtualAnalogOut,
+    _VirtualAnalogChannel
 )
 from .utils import (
     LabscriptError,
